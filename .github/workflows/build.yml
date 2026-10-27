@@ -1,0 +1,24 @@
+name: Build Windows 64-bit VST3
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build-vst3:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure CMake (64-bit)
+        run: cmake -B build -G "Visual Studio 17 2022" -A x64
+
+      - name: Compile Release VST3
+        run: cmake --build build --config Release --target VocalPhonemeGain_VST3
+
+      - name: Upload Compiled .vst3 File for Download
+        uses: actions/upload-artifact@v4
+        with:
+          name: VocalPhonemeGain-Windows-x64-VST3
+          path: build/VocalPhonemeGain_artefacts/Release/VST3/VocalPhonemeGain.vst3
