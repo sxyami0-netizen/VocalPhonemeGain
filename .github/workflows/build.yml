@@ -4,18 +4,771 @@ on:
   push:
   workflow_dispatch:
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   build-vst3:
     runs-on: windows-latest
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
+      - name: Generate Project Files & Source Code
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "Source" | Out-Null
 
-      - name: Configure CMake (64-bit)
-        run: cmake -B build -G "Visual Studio 17 2022" -A x64
+          @'
+          cmake_minimum_required(VERSION 3.22)
+          project(VocalPhonemeGain VERSION 1.0.0)
 
-      - name: Compile Release VST3
-        run: cmake --build build --config Release --target VocalPhonemeGain_VST3
+          set(CMAKE_CXX_STANDARD 17)
+          set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+          include(FetchContent)
+          FetchContent_Declare(
+              JUCE
+              GIT_REPOSITORY https://github.com/juce-framework/JUCE.git
+              GIT_TAG        8.0.4
+          )
+          FetchContent_MakeAvailable(JUCE)
+
+          juce_add_plugin(VocalPhonemeGain
+              COMPANY_NAME "CustomAudioDSP"
+              IS_SYNTH FALSE
+              NEEDS_MIDI_INPUT FALSE
+              NEEDS_MIDI_OUTPUT FALSE
+              IS_MIDI_EFFECT FALSE
+              EDITOR_WANTS_KEYBOARD_FOCUS FALSE
+              COPY_PLUGIN_AFTER_BUILD FALSE
+              PLUGIN_MANUFACTURER_CODE Cadp
+              PLUGIN_CODE Vpg1
+              FORMATS VST3
+              PRODUCT_NAME "VocalPhonemeGain"
+          )
+
+          target_sources(VocalPhonemeGain
+              PRIVATE
+                  Source/PluginProcessor.cpp
+                  Source/PluginProcessor.h
+                  Source/PluginEditor.cpp
+                  Source/PluginEditor.h
+          )
+
+          target_compile_definitions(VocalPhonemeGain
+              PUBLIC
+                  JUCE_WEB_BROWSER=0
+                  JUCE_USE_CURL=0
+                  JUCE_VST3_CAN_REPLACE_VST2=0
+          )
+
+          target_link_libraries(VocalPhonemeGain
+              PRIVATE
+                  juce::juce_audio_utils
+                  juce::juce_dsp
+              PUBLIC
+                  juce::juce_recommended_config_flags
+                  juce::juce_recommended_warning_flags
+          )
+          '@ | Set-Content -Path "CMakeLists.txt" -Encoding UTF8
+
+          @'
+          #pragma once
+          #include <juce_audio_processors/juce_audio_processors.h>
+          #include <juce_dsp/juce_dsp.h>
+          #include <vector>
+          #include <atomic>
+
+          enum class PhonemeType : int { Silence = 0, Vowel = 1, Consonant = 2 };
+
+          struct PhonemeClip
+          {
+              double startTimeSec = 0.0;
+              double endTimeSec   = 0.05;
+              PhonemeType type    = PhonemeType::Vowel;
+              float peakLevel     = 0.0f;
+              float clipGainDb    = 0.0f;
+          };
+
+          class VocalPhonemeGainAudioProcessor : public juce::AudioProcessor
+          {
+          public:
+              VocalPhonemeGainAudioProcessor();
+              ~VocalPhonemeGainAudioProcessor() override = default;
+
+              void prepareToPlay (double sampleRate, int samplesPerBlock) override;
+              void releaseResources() override;
+              bool isBusesLayoutSupported (const BusesLayout& layouts) const override;
+              void processBlock (juce::AudioBuffer<float>&, juce::MidiBuffer&) override;
+
+              juce::AudioProcessorEditor* createEditor() override;
+              bool hasEditor() const override { return true; }
+
+              const juce::String getName() const override { return JucePlugin_Name; }
+              bool acceptsMidi() const override { return false; }
+              bool producesMidi() const override { return false; }
+              bool isMidiEffect() const override { return false; }
+              double getTailLengthSeconds() const override { return 0.0; }
+
+              int getNumPrograms() override { return 1; }
+              int getCurrentProgram() override { return 0; }
+              void setCurrentProgram (int) override {}
+              const juce::String getProgramName (int) override { return {}; }
+              void changeProgramName (int, const juce::String&) override {}
+
+              void getStateInformation (juce::MemoryBlock& destData) override;
+              void setStateInformation (const void* data, int sizeInBytes) override;
+
+              juce::AudioProcessorValueTreeState apvts;
+              static juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
+
+              std::vector<PhonemeClip> getClipsCopy() const;
+              void setClipGain (size_t index, float newGainDb);
+              void toggleClipType (size_t index);
+              void clearClips();
+              void resetAllClipGains();
+
+              std::atomic<double> currentPlayheadSec { 0.0 };
+              std::atomic<int> activePhonemeType { 0 };
+              std::atomic<float> currentAppliedGainDb { 0.0f };
+              std::atomic<bool> captureEnabled { true };
+
+          private:
+              PhonemeType classifyFrame (const float* monoData, int numSamples, float thresholdLinear, float vcBias, float& outPeak);
+              int findOrCreateClipForTime (double timeSec, double blockDurationSec, PhonemeType detectedType, float peak);
+
+              mutable juce::SpinLock clipLock;
+              std::vector<PhonemeClip> clips;
+
+              double currentSampleRate = 44100.0;
+              double fallbackPlayheadSec = 0.0;
+              float lpState = 0.0f;
+              float lpCoeff = 0.2f;
+              float smoothedGainLinear = 1.0f;
+
+              PhonemeType pendingType = PhonemeType::Silence;
+              double pendingDurationSec = 0.0;
+              PhonemeType stableType = PhonemeType::Silence;
+
+              JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (VocalPhonemeGainAudioProcessor)
+          };
+          '@ | Set-Content -Path "Source/PluginProcessor.h" -Encoding UTF8
+
+          @'
+          #include "PluginProcessor.h"
+          #include "PluginEditor.h"
+          #include <cmath>
+          #include <algorithm>
+
+          VocalPhonemeGainAudioProcessor::VocalPhonemeGainAudioProcessor()
+              : AudioProcessor (BusesProperties()
+                                .withInput  ("Input",  juce::AudioChannelSet::stereo(), true)
+                                .withOutput ("Output", juce::AudioChannelSet::stereo(), true)),
+                apvts (*this, nullptr, "PARAMETERS", createParameterLayout())
+          {
+              clips.reserve (2048);
+          }
+
+          juce::AudioProcessorValueTreeState::ParameterLayout VocalPhonemeGainAudioProcessor::createParameterLayout()
+          {
+              std::vector<std::unique_ptr<juce::RangedAudioParameter>> params;
+              params.push_back (std::make_unique<juce::AudioParameterFloat>("vowelGain", "All Vowels Gain", juce::NormalisableRange<float> (-18.0f, 12.0f, 0.1f), 0.0f, "dB"));
+              params.push_back (std::make_unique<juce::AudioParameterFloat>("consonantGain", "All Consonants Gain", juce::NormalisableRange<float> (-18.0f, 12.0f, 0.1f), 0.0f, "dB"));
+              params.push_back (std::make_unique<juce::AudioParameterFloat>("threshold", "Gate Threshold", juce::NormalisableRange<float> (-60.0f, -12.0f, 0.5f), -42.0f, "dB"));
+              params.push_back (std::make_unique<juce::AudioParameterFloat>("vcSensitivity", "V/C Split Bias", juce::NormalisableRange<float> (0.1f, 0.9f, 0.01f), 0.5f, ""));
+              params.push_back (std::make_unique<juce::AudioParameterFloat>("smoothingMs", "Transition Smooth", juce::NormalisableRange<float> (1.0f, 50.0f, 0.5f), 8.0f, "ms"));
+              return { params.begin(), params.end() };
+          }
+
+          void VocalPhonemeGainAudioProcessor::prepareToPlay (double sampleRate, int)
+          {
+              currentSampleRate = sampleRate > 0.0 ? sampleRate : 44100.0;
+              const float cutoffHz = 2400.0f;
+              lpCoeff = 1.0f - std::exp (-2.0f * juce::MathConstants<float>::pi * cutoffHz / static_cast<float>(currentSampleRate));
+              lpState = 0.0f;
+              smoothedGainLinear = 1.0f;
+          }
+
+          void VocalPhonemeGainAudioProcessor::releaseResources() {}
+
+          bool VocalPhonemeGainAudioProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
+          {
+              const auto& mainIn  = layouts.getMainInputChannelSet();
+              const auto& mainOut = layouts.getMainOutputChannelSet();
+              if (mainIn != mainOut) return false;
+              return mainIn == juce::AudioChannelSet::mono() || mainIn == juce::AudioChannelSet::stereo();
+          }
+
+          PhonemeType VocalPhonemeGainAudioProcessor::classifyFrame (
+              const float* monoData, int numSamples, float thresholdLinear, float vcBias, float& outPeak)
+          {
+              if (numSamples <= 0) { outPeak = 0.0f; return PhonemeType::Silence; }
+
+              float sumSq = 0.0f, lowEnergy = 0.0f, highEnergy = 0.0f, peak = 0.0f;
+              int zeroCrossings = 0;
+              float prevSample = monoData[0];
+
+              for (int i = 0; i < numSamples; ++i)
+              {
+                  const float s = monoData[i];
+                  const float absS = std::abs (s);
+                  if (absS > peak) peak = absS;
+                  sumSq += s * s;
+
+                  lpState += lpCoeff * (s - lpState);
+                  const float hp = s - lpState;
+                  lowEnergy  += lpState * lpState;
+                  highEnergy += hp * hp;
+
+                  if ((s >= 0.0f && prevSample < 0.0f) || (s < 0.0f && prevSample >= 0.0f))
+                      ++zeroCrossings;
+                  prevSample = s;
+              }
+
+              outPeak = peak;
+              const float rms = std::sqrt (sumSq / static_cast<float>(numSamples));
+              if (rms < thresholdLinear) return PhonemeType::Silence;
+
+              const float zcrNorm = static_cast<float>(zeroCrossings) / static_cast<float>(numSamples);
+              const float hfRatio = highEnergy / (lowEnergy + highEnergy + 1.0e-7f);
+              const float consonantScore = (hfRatio * 0.65f) + (juce::jlimit (0.0f, 1.0f, zcrNorm * 3.5f) * 0.35f);
+              const float thresholdScore = 1.0f - vcBias;
+
+              return (consonantScore >= thresholdScore * 0.45f) ? PhonemeType::Consonant : PhonemeType::Vowel;
+          }
+
+          int VocalPhonemeGainAudioProcessor::findOrCreateClipForTime (
+              double timeSec, double blockDurationSec, PhonemeType detectedType, float peak)
+          {
+              for (int i = 0; i < static_cast<int>(clips.size()); ++i)
+              {
+                  auto& c = clips[static_cast<size_t>(i)];
+                  if (timeSec >= c.startTimeSec && timeSec <= c.endTimeSec)
+                  {
+                      if (captureEnabled.load() && peak > c.peakLevel) c.peakLevel = peak;
+                      return i;
+                  }
+              }
+
+              if (!captureEnabled.load() || detectedType == PhonemeType::Silence)
+                  return -1;
+
+              const double mergeToleranceSec = 0.045;
+              if (!clips.empty())
+              {
+                  auto& last = clips.back();
+                  if (last.type == detectedType &&
+                      std::abs (timeSec - last.endTimeSec) <= mergeToleranceSec &&
+                      (last.endTimeSec - last.startTimeSec) < 0.85)
+                  {
+                      last.endTimeSec = std::max (last.endTimeSec, timeSec + blockDurationSec);
+                      last.peakLevel  = std::max (last.peakLevel, peak);
+                      return static_cast<int>(clips.size()) - 1;
+                  }
+              }
+
+              if (clips.size() < 2048)
+              {
+                  PhonemeClip newClip;
+                  newClip.startTimeSec = timeSec;
+                  newClip.endTimeSec   = timeSec + std::max (blockDurationSec, 0.04);
+                  newClip.type         = detectedType;
+                  newClip.peakLevel    = peak;
+                  newClip.clipGainDb   = 0.0f;
+                  clips.push_back (newClip);
+                  return static_cast<int>(clips.size()) - 1;
+              }
+              return -1;
+          }
+
+          void VocalPhonemeGainAudioProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBuffer&)
+          {
+              juce::ScopedNoDenormals noDenormals;
+              const int numChannels = buffer.getNumChannels();
+              const int numSamples  = buffer.getNumSamples();
+              if (numChannels == 0 || numSamples == 0) return;
+
+              const float vowelGainDb     = apvts.getRawParameterValue ("vowelGain")->load();
+              const float consonantGainDb = apvts.getRawParameterValue ("consonantGain")->load();
+              const float thresholdDb     = apvts.getRawParameterValue ("threshold")->load();
+              const float vcBias          = apvts.getRawParameterValue ("vcSensitivity")->load();
+              const float smoothingMs     = apvts.getRawParameterValue ("smoothingMs")->load();
+
+              const float thresholdLinear = juce::Decibels::decibelsToGain (thresholdDb);
+              const double blockDurationSec = static_cast<double>(numSamples) / currentSampleRate;
+
+              double playTimeSec = fallbackPlayheadSec;
+              bool isPlaying = true;
+
+              if (auto* playHead = getPlayHead())
+              {
+                  if (auto posInfo = playHead->getPosition())
+                  {
+                      isPlaying = posInfo->getIsPlaying();
+                      if (auto timeSec = posInfo->getTimeInSeconds())
+                          playTimeSec = *timeSec;
+                  }
+              }
+
+              if (isPlaying) fallbackPlayheadSec = playTimeSec + blockDurationSec;
+              currentPlayheadSec.store (playTimeSec);
+
+              float framePeak = 0.0f;
+              PhonemeType rawType = classifyFrame (buffer.getReadPointer (0), numSamples, thresholdLinear, vcBias, framePeak);
+
+              if (rawType == pendingType)
+              {
+                  pendingDurationSec += blockDurationSec;
+                  if (pendingDurationSec >= 0.030 || rawType == PhonemeType::Silence)
+                      stableType = rawType;
+              }
+              else
+              {
+                  pendingType = rawType;
+                  pendingDurationSec = blockDurationSec;
+              }
+
+              float targetGainDb = 0.0f;
+              PhonemeType effectiveType = stableType;
+
+              {
+                  const juce::SpinLock::ScopedTryLockType lock (clipLock);
+                  if (lock.isLocked() && isPlaying)
+                  {
+                      const int clipIdx = findOrCreateClipForTime (playTimeSec, blockDurationSec, stableType, framePeak);
+                      if (clipIdx >= 0 && clipIdx < static_cast<int>(clips.size()))
+                      {
+                          const auto& clip = clips[static_cast<size_t>(clipIdx)];
+                          effectiveType = clip.type;
+                          targetGainDb += clip.clipGainDb;
+                      }
+                  }
+              }
+
+              if (effectiveType == PhonemeType::Vowel)          targetGainDb += vowelGainDb;
+              else if (effectiveType == PhonemeType::Consonant) targetGainDb += consonantGainDb;
+
+              activePhonemeType.store (static_cast<int>(effectiveType));
+              currentAppliedGainDb.store (targetGainDb);
+
+              const float targetGainLinear = juce::Decibels::decibelsToGain (targetGainDb);
+              const float smoothSamples = std::max (1.0f, static_cast<float>(currentSampleRate) * (smoothingMs * 0.001f));
+              const float alpha = 1.0f - std::exp (-1.0f / smoothSamples);
+
+              for (int sample = 0; sample < numSamples; ++sample)
+              {
+                  smoothedGainLinear += alpha * (targetGainLinear - smoothedGainLinear);
+                  for (int ch = 0; ch < numChannels; ++ch)
+                      buffer.getWritePointer (ch)[sample] *= smoothedGainLinear;
+              }
+          }
+
+          std::vector<PhonemeClip> VocalPhonemeGainAudioProcessor::getClipsCopy() const
+          {
+              const juce::SpinLock::ScopedLockType lock (clipLock);
+              return clips;
+          }
+
+          void VocalPhonemeGainAudioProcessor::setClipGain (size_t index, float newGainDb)
+          {
+              const juce::SpinLock::ScopedLockType lock (clipLock);
+              if (index < clips.size()) clips[index].clipGainDb = juce::jlimit (-18.0f, 12.0f, newGainDb);
+          }
+
+          void VocalPhonemeGainAudioProcessor::toggleClipType (size_t index)
+          {
+              const juce::SpinLock::ScopedLockType lock (clipLock);
+              if (index < clips.size())
+                  clips[index].type = (clips[index].type == PhonemeType::Vowel) ? PhonemeType::Consonant : PhonemeType::Vowel;
+          }
+
+          void VocalPhonemeGainAudioProcessor::clearClips()
+          {
+              const juce::SpinLock::ScopedLockType lock (clipLock);
+              clips.clear();
+          }
+
+          void VocalPhonemeGainAudioProcessor::resetAllClipGains()
+          {
+              const juce::SpinLock::ScopedLockType lock (clipLock);
+              for (auto& c : clips) c.clipGainDb = 0.0f;
+          }
+
+          void VocalPhonemeGainAudioProcessor::getStateInformation (juce::MemoryBlock& destData)
+          {
+              auto state = apvts.copyState();
+              std::unique_ptr<juce::XmlElement> xml (state.createXml());
+              auto* clipsXml = xml->createNewChildElement ("PhonemeClips");
+              for (const auto& c : getClipsCopy())
+              {
+                  auto* item = clipsXml->createNewChildElement ("Clip");
+                  item->setAttribute ("start", c.startTimeSec);
+                  item->setAttribute ("end",   c.endTimeSec);
+                  item->setAttribute ("type",  static_cast<int>(c.type));
+                  item->setAttribute ("peak",  static_cast<double>(c.peakLevel));
+                  item->setAttribute ("gain",  static_cast<double>(c.clipGainDb));
+              }
+              copyXmlToBinary (*xml, destData);
+          }
+
+          void VocalPhonemeGainAudioProcessor::setStateInformation (const void* data, int sizeInBytes)
+          {
+              std::unique_ptr<juce::XmlElement> xmlState (getXmlFromBinary (data, sizeInBytes));
+              if (xmlState != nullptr && xmlState->hasTagName (apvts.state.getType()))
+              {
+                  apvts.replaceState (juce::ValueTree::fromXml (*xmlState));
+                  if (auto* clipsXml = xmlState->getChildByName ("PhonemeClips"))
+                  {
+                      std::vector<PhonemeClip> loaded;
+                      for (auto* item : clipsXml->getChildIterator())
+                      {
+                          PhonemeClip c;
+                          c.startTimeSec = item->getDoubleAttribute ("start", 0.0);
+                          c.endTimeSec   = item->getDoubleAttribute ("end", 0.05);
+                          c.type         = static_cast<PhonemeType>(item->getIntAttribute ("type", 1));
+                          c.peakLevel    = static_cast<float>(item->getDoubleAttribute ("peak", 0.5));
+                          c.clipGainDb   = static_cast<float>(item->getDoubleAttribute ("gain", 0.0));
+                          loaded.push_back (c);
+                      }
+                      const juce::SpinLock::ScopedLockType lock (clipLock);
+                      clips = std::move (loaded);
+                  }
+              }
+          }
+
+          juce::AudioProcessorEditor* VocalPhonemeGainAudioProcessor::createEditor()
+          {
+              return new VocalPhonemeGainAudioProcessorEditor (*this);
+          }
+
+          juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter()
+          {
+              return new VocalPhonemeGainAudioProcessor();
+          }
+          '@ | Set-Content -Path "Source/PluginProcessor.cpp" -Encoding UTF8
+
+          @'
+          #pragma once
+          #include "PluginProcessor.h"
+          #include <juce_gui_basics/juce_gui_basics.h>
+
+          class PhonemeTimelineComponent : public juce::Component
+          {
+          public:
+              explicit PhonemeTimelineComponent (VocalPhonemeGainAudioProcessor& proc);
+              void paint (juce::Graphics& g) override;
+              void mouseDown (const juce::MouseEvent& e) override;
+              void mouseDrag (const juce::MouseEvent& e) override;
+              void mouseDoubleClick (const juce::MouseEvent& e) override;
+              void mouseWheelMove (const juce::MouseEvent& e, const juce::MouseWheelDetails& wheel) override;
+              void updateFromProcessor();
+
+          private:
+              VocalPhonemeGainAudioProcessor& processor;
+              std::vector<PhonemeClip> cachedClips;
+              double viewStartSec = 0.0;
+              double viewDurationSec = 8.0;
+              int draggedClipIndex = -1;
+              float dragStartGainDb = 0.0f;
+
+              int hitTestClip (juce::Point<float> pt) const;
+              float timeToX (double t) const;
+              double xToTime (float x) const;
+              float gainDbToY (float db) const;
+          };
+
+          class VocalPhonemeGainAudioProcessorEditor : public juce::AudioProcessorEditor, private juce::Timer
+          {
+          public:
+              explicit VocalPhonemeGainAudioProcessorEditor (VocalPhonemeGainAudioProcessor&);
+              ~VocalPhonemeGainAudioProcessorEditor() override;
+              void paint (juce::Graphics&) override;
+              void resized() override;
+
+          private:
+              void timerCallback() override;
+              void setupKnob (juce::Slider& slider, juce::Label& label, const juce::String& text);
+
+              VocalPhonemeGainAudioProcessor& audioProcessor;
+              PhonemeTimelineComponent timeline;
+
+              juce::ToggleButton captureButton { "Auto-Capture Phonemes" };
+              juce::TextButton resetGainsButton { "Reset Clip Gains" };
+              juce::TextButton clearMapButton { "Clear Map" };
+
+              juce::Slider vowelGainSlider, consonantGainSlider, thresholdSlider, vcBiasSlider, smoothSlider;
+              juce::Label  vowelGainLabel,  consonantGainLabel,  thresholdLabel,  vcBiasLabel,  smoothLabel;
+
+              using SliderAttachment = juce::AudioProcessorValueTreeState::SliderAttachment;
+              std::unique_ptr<SliderAttachment> vowelAttach, consonantAttach, thresholdAttach, vcBiasAttach, smoothAttach;
+
+              JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (VocalPhonemeGainAudioProcessorEditor)
+          };
+          '@ | Set-Content -Path "Source/PluginEditor.h" -Encoding UTF8
+
+          @'
+          #include "PluginEditor.h"
+
+          PhonemeTimelineComponent::PhonemeTimelineComponent (VocalPhonemeGainAudioProcessor& proc) : processor (proc) {}
+
+          float PhonemeTimelineComponent::timeToX (double t) const
+          {
+              return static_cast<float>((t - viewStartSec) / viewDurationSec) * static_cast<float>(getWidth());
+          }
+
+          double PhonemeTimelineComponent::xToTime (float x) const
+          {
+              return viewStartSec + (static_cast<double>(x) / static_cast<double>(getWidth())) * viewDurationSec;
+          }
+
+          float PhonemeTimelineComponent::gainDbToY (float db) const
+          {
+              const float norm = (12.0f - juce::jlimit (-18.0f, 12.0f, db)) / 30.0f;
+              return 24.0f + norm * (static_cast<float>(getHeight()) - 48.0f);
+          }
+
+          int PhonemeTimelineComponent::hitTestClip (juce::Point<float> pt) const
+          {
+              const double clickTime = xToTime (pt.x);
+              for (int i = 0; i < static_cast<int>(cachedClips.size()); ++i)
+              {
+                  const auto& c = cachedClips[static_cast<size_t>(i)];
+                  if (clickTime >= c.startTimeSec && clickTime <= c.endTimeSec) return i;
+              }
+              return -1;
+          }
+
+          void PhonemeTimelineComponent::updateFromProcessor()
+          {
+              cachedClips = processor.getClipsCopy();
+              const double playhead = processor.currentPlayheadSec.load();
+              if (playhead < viewStartSec || playhead > (viewStartSec + viewDurationSec * 0.90))
+                  viewStartSec = std::max (0.0, playhead - viewDurationSec * 0.15);
+              repaint();
+          }
+
+          void PhonemeTimelineComponent::paint (juce::Graphics& g)
+          {
+              const auto bounds = getLocalBounds().toFloat();
+              g.setColour (juce::Colour (0xff14171c));
+              g.fillRoundedRectangle (bounds, 6.0f);
+
+              const float zeroDbY = gainDbToY (0.0f);
+              g.setColour (juce::Colour (0xff2e3440));
+              g.drawHorizontalLine (static_cast<int>(zeroDbY), 0.0f, bounds.getWidth());
+
+              g.setFont (11.0f);
+              const int firstSec = static_cast<int>(std::floor (viewStartSec));
+              const int lastSec  = static_cast<int>(std::ceil (viewStartSec + viewDurationSec));
+              for (int s = firstSec; s <= lastSec; ++s)
+              {
+                  const float x = timeToX (static_cast<double>(s));
+                  g.setColour (juce::Colour (0xff20242c));
+                  g.drawVerticalLine (static_cast<int>(x), 0.0f, bounds.getHeight());
+                  g.setColour (juce::Colour (0xff6c7686));
+                  g.drawText (juce::String (s) + "s", static_cast<int>(x) + 4, 4, 40, 14, juce::Justification::left);
+              }
+
+              for (size_t i = 0; i < cachedClips.size(); ++i)
+              {
+                  const auto& c = cachedClips[i];
+                  if (c.endTimeSec < viewStartSec || c.startTimeSec > (viewStartSec + viewDurationSec)) continue;
+
+                  const float x1 = juce::jlimit (0.0f, bounds.getWidth(), timeToX (c.startTimeSec));
+                  const float x2 = juce::jlimit (0.0f, bounds.getWidth(), timeToX (c.endTimeSec));
+                  const float w  = std::max (6.0f, x2 - x1 - 1.5f);
+
+                  const bool isVowel = (c.type == PhonemeType::Vowel);
+                  const juce::Colour baseCol = isVowel ? juce::Colour (0xff38bdf8) : juce::Colour (0xfff59e0b);
+                  const float handleY = gainDbToY (c.clipGainDb);
+
+                  const float scaledPeak = juce::jlimit (0.1f, 1.0f, c.peakLevel * juce::Decibels::decibelsToGain (c.clipGainDb));
+                  const float waveHalfH  = scaledPeak * (bounds.getHeight() * 0.34f);
+
+                  juce::Rectangle<float> clipBox (x1, zeroDbY - waveHalfH, w, waveHalfH * 2.0f);
+                  g.setColour (baseCol.withAlpha (0.24f));
+                  g.fillRoundedRectangle (clipBox, 3.0f);
+                  g.setColour (baseCol.withAlpha (0.65f));
+                  g.drawRoundedRectangle (clipBox, 3.0f, 1.0f);
+
+                  g.setColour (baseCol);
+                  g.fillRect (x1, handleY - 1.5f, w, 3.0f);
+
+                  if (w >= 14.0f)
+                  {
+                      g.setColour (juce::Colours::white.withAlpha (0.9f));
+                      g.setFont (juce::FontOptions (11.0f, juce::Font::bold));
+                      juce::String tag = isVowel ? "V" : "C";
+                      if (std::abs (c.clipGainDb) >= 0.1f && w >= 34.0f) tag += " " + juce::String (c.clipGainDb, 1);
+                      g.drawText (tag, static_cast<int>(x1) + 2, static_cast<int>(handleY) - 16, static_cast<int>(w) - 4, 14, juce::Justification::centred);
+                  }
+              }
+
+              const float playX = timeToX (processor.currentPlayheadSec.load());
+              if (playX >= 0.0f && playX <= bounds.getWidth())
+              {
+                  g.setColour (juce::Colour (0xffef4444));
+                  g.drawLine (playX, 0.0f, playX, bounds.getHeight(), 2.0f);
+              }
+
+              if (cachedClips.empty())
+              {
+                  g.setColour (juce::Colour (0xff8892b0));
+                  g.setFont (14.0f);
+                  g.drawText ("Press Play in Studio One / Cubase to detect Vowels (Cyan) & Consonants (Amber). Drag any clip up/down to adjust gain.",
+                              getLocalBounds().reduced (20), juce::Justification::centred);
+              }
+          }
+
+          void PhonemeTimelineComponent::mouseDown (const juce::MouseEvent& e)
+          {
+              const int idx = hitTestClip (e.position);
+              if (idx >= 0)
+              {
+                  if (e.mods.isRightButtonDown())
+                  {
+                      processor.toggleClipType (static_cast<size_t>(idx));
+                      updateFromProcessor();
+                      return;
+                  }
+                  draggedClipIndex = idx;
+                  dragStartGainDb  = cachedClips[static_cast<size_t>(idx)].clipGainDb;
+              }
+              else draggedClipIndex = -1;
+          }
+
+          void PhonemeTimelineComponent::mouseDrag (const juce::MouseEvent& e)
+          {
+              if (draggedClipIndex >= 0)
+              {
+                  const float deltaDb = -static_cast<float>(e.getDistanceFromDragStartY()) * 0.15f;
+                  processor.setClipGain (static_cast<size_t>(draggedClipIndex), dragStartGainDb + deltaDb);
+                  updateFromProcessor();
+              }
+          }
+
+          void PhonemeTimelineComponent::mouseDoubleClick (const juce::MouseEvent& e)
+          {
+              const int idx = hitTestClip (e.position);
+              if (idx >= 0)
+              {
+                  processor.setClipGain (static_cast<size_t>(idx), 0.0f);
+                  updateFromProcessor();
+              }
+          }
+
+          void PhonemeTimelineComponent::mouseWheelMove (const juce::MouseEvent&, const juce::MouseWheelDetails& wheel)
+          {
+              if (std::abs (wheel.deltaX) > 0.0f)      viewStartSec = std::max (0.0, viewStartSec - wheel.deltaX * 1.5);
+              else if (std::abs (wheel.deltaY) > 0.0f) viewStartSec = std::max (0.0, viewStartSec - wheel.deltaY * 1.5);
+              repaint();
+          }
+
+          VocalPhonemeGainAudioProcessorEditor::VocalPhonemeGainAudioProcessorEditor (VocalPhonemeGainAudioProcessor& p)
+              : AudioProcessorEditor (&p), audioProcessor (p), timeline (p)
+          {
+              setSize (780, 440);
+              addAndMakeVisible (timeline);
+
+              captureButton.setToggleState (audioProcessor.captureEnabled.load(), juce::dontSendNotification);
+              captureButton.onClick = [this] { audioProcessor.captureEnabled.store (captureButton.getToggleState()); };
+              addAndMakeVisible (captureButton);
+
+              resetGainsButton.onClick = [this] { audioProcessor.resetAllClipGains(); timeline.updateFromProcessor(); };
+              addAndMakeVisible (resetGainsButton);
+
+              clearMapButton.onClick = [this] { audioProcessor.clearClips(); timeline.updateFromProcessor(); };
+              addAndMakeVisible (clearMapButton);
+
+              setupKnob (vowelGainSlider,     vowelGainLabel,     "All Vowels (dB)");
+              setupKnob (consonantGainSlider, consonantGainLabel, "All Consonants (dB)");
+              setupKnob (thresholdSlider,     thresholdLabel,     "Gate Threshold");
+              setupKnob (vcBiasSlider,        vcBiasLabel,        "V/C Split Bias");
+              setupKnob (smoothSlider,        smoothLabel,        "Smooth (ms)");
+
+              vowelAttach     = std::make_unique<SliderAttachment>(audioProcessor.apvts, "vowelGain",     vowelGainSlider);
+              consonantAttach = std::make_unique<SliderAttachment>(audioProcessor.apvts, "consonantGain", consonantGainSlider);
+              thresholdAttach = std::make_unique<SliderAttachment>(audioProcessor.apvts, "threshold",     thresholdSlider);
+              vcBiasAttach    = std::make_unique<SliderAttachment>(audioProcessor.apvts, "vcSensitivity", vcBiasSlider);
+              smoothAttach    = std::make_unique<SliderAttachment>(audioProcessor.apvts, "smoothingMs",   smoothSlider);
+
+              startTimerHz (30);
+          }
+
+          VocalPhonemeGainAudioProcessorEditor::~VocalPhonemeGainAudioProcessorEditor() { stopTimer(); }
+
+          void VocalPhonemeGainAudioProcessorEditor::setupKnob (juce::Slider& slider, juce::Label& label, const juce::String& text)
+          {
+              slider.setSliderStyle (juce::Slider::RotaryHorizontalVerticalDrag);
+              slider.setTextBoxStyle (juce::Slider::TextBoxBelow, false, 70, 18);
+              slider.setColour (juce::Slider::rotarySliderFillColourId, juce::Colour (0xff38bdf8));
+              slider.setColour (juce::Slider::thumbColourId, juce::Colours::white);
+              addAndMakeVisible (slider);
+
+              label.setText (text, juce::dontSendNotification);
+              label.setJustificationType (juce::Justification::centred);
+              label.setFont (juce::FontOptions (12.5f, juce::Font::bold));
+              label.setColour (juce::Label::textColourId, juce::Colour (0xffcbd5e1));
+              addAndMakeVisible (label);
+          }
+
+          void VocalPhonemeGainAudioProcessorEditor::timerCallback()
+          {
+              timeline.updateFromProcessor();
+              repaint (0, 0, getWidth(), 48);
+          }
+
+          void VocalPhonemeGainAudioProcessorEditor::paint (juce::Graphics& g)
+          {
+              g.fillAll (juce::Colour (0xff0f1115));
+              g.setColour (juce::Colours::white);
+              g.setFont (juce::FontOptions (18.0f, juce::Font::bold));
+              g.drawText ("VOCAL PHONEME CLIP GAIN", 18, 12, 260, 24, juce::Justification::left);
+
+              const int pType = audioProcessor.activePhonemeType.load();
+              const float gainDb = audioProcessor.currentAppliedGainDb.load();
+
+              juce::String badgeText = "SILENCE";
+              juce::Colour badgeCol  = juce::Colour (0xff334155);
+              if (pType == 1) { badgeText = "VOWEL";     badgeCol = juce::Colour (0xff0284c7); }
+              if (pType == 2) { badgeText = "CONSONANT"; badgeCol = juce::Colour (0xffd97706); }
+
+              juce::Rectangle<float> badgeRect (275.0f, 12.0f, 155.0f, 24.0f);
+              g.setColour (badgeCol);
+              g.fillRoundedRectangle (badgeRect, 4.0f);
+              g.setColour (juce::Colours::white);
+              g.setFont (juce::FontOptions (12.0f, juce::Font::bold));
+              g.drawText (badgeText + " (" + juce::String (gainDb, 1) + " dB)", badgeRect, juce::Justification::centred);
+          }
+
+          void VocalPhonemeGainAudioProcessorEditor::resized()
+          {
+              captureButton.setBounds (450, 12, 165, 24);
+              resetGainsButton.setBounds (620, 12, 85, 24);
+              clearMapButton.setBounds (710, 12, 55, 24);
+              timeline.setBounds (16, 48, getWidth() - 32, 245);
+
+              const int knobY = 322;
+              const int colW  = (getWidth() - 32) / 5;
+              juce::Slider* sliders[] = { &vowelGainSlider, &consonantGainSlider, &thresholdSlider, &vcBiasSlider, &smoothSlider };
+              juce::Label*  labels[]  = { &vowelGainLabel,  &consonantGainLabel,  &thresholdLabel,  &vcBiasLabel,  &smoothLabel };
+
+              for (int i = 0; i < 5; ++i)
+              {
+                  const int x = 16 + i * colW;
+                  labels[i]->setBounds (x, knobY - 20, colW, 18);
+                  sliders[i]->setBounds (x + 12, knobY, colW - 24, 105);
+              }
+          }
+          '@ | Set-Content -Path "Source/PluginEditor.cpp" -Encoding UTF8
+
+      - name: Setup MSVC 64-bit Compiler
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Configure & Compile Release VST3
+        run: |
+          cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --config Release --target VocalPhonemeGain_VST3
 
       - name: Upload Compiled .vst3 File for Download
         uses: actions/upload-artifact@v4
